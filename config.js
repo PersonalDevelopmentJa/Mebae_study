@@ -12,5 +12,5 @@
    ========================================================= */
 window.MEBAE_CONFIG = {
   SUPABASE_URL: "https://zdiuzshsupplwvwyfrff.supabase.co/rest/v1/",
-  SUPABASE_ANON_KEY: "Takahashi946611.",
+  SUPABASE_ANON_KEY: "sb_publishable_-eCVLh-iUlnO6t3jD5BP9Q_OiWUxCuK",
 };
