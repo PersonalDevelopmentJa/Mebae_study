@@ -11,6 +11,6 @@
    ※ service_role キー（secret key）は絶対にここに書かないこと！
    ========================================================= */
 window.MEBAE_CONFIG = {
-  SUPABASE_URL: "https://YOUR-PROJECT-ID.supabase.co",
-  SUPABASE_ANON_KEY: "YOUR-ANON-KEY",
+  SUPABASE_URL: "https://zdiuzshsupplwvwyfrff.supabase.co/rest/v1/",
+  SUPABASE_ANON_KEY: "Takahashi946611.",
 };
