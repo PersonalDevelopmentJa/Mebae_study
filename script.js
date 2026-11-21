@@ -1,18 +1,32 @@
 /* =========================================================
-   めばえ ― app logic
-   ユーザーごとに localStorage へ保存されるので、ページを閉じても
-   今日の進捗・タスク・メモ・ストリークは消えません。
+   めばえ ― app logic（Supabase 版）
 
-   ※ ログインは「名前＋4桁の合言葉」による端末内だけの簡易的な
-   仕組みです。サーバーを持たないため、本格的な認証や複数端末での
-   同期はできません。
+   ・ログインは Supabase Auth（メール＋パスワード）
+   ・アプリの状態はユーザーごとに Supabase の app_state テーブルへ
+     1行の JSON として保存（supabase.sql 参照）
+   ・保存は変更のたびに少し待ってからまとめて送信（デバウンス）。
+     同じ内容を localStorage にもキャッシュしておき、
+     通信できなかったときの保険にする。
    ========================================================= */
 (() => {
-  const USERS_KEY = "mebae-users-v1";        // { [username]: pin }
-  const ACTIVE_USER_KEY = "mebae-active-user";
   const RING_CIRCUMFERENCE = 2 * Math.PI * 104; // 653.45
+  const SAVE_DELAY_MS = 800;   // 最後の変更からこの時間待って保存
+  const CACHE_PREFIX = "mebae-cache-v2::";
 
-  const todayStr = () => new Date().toISOString().slice(0, 10);
+  // ---------- Supabase client ----------
+  const cfg = window.MEBAE_CONFIG || {};
+  const configMissing =
+    !cfg.SUPABASE_URL || !cfg.SUPABASE_ANON_KEY ||
+    cfg.SUPABASE_URL.includes("YOUR-PROJECT-ID") || cfg.SUPABASE_ANON_KEY.includes("YOUR-ANON-KEY");
+  const sb = (!configMissing && window.supabase)
+    ? window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_ANON_KEY)
+    : null;
+
+  // 端末のローカル時刻で YYYY-MM-DD を作る
+  // （toISOString は UTC なので、日本だと朝9時まで前日扱いになってしまう）
+  const localDateStr = (d) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const todayStr = () => localDateStr(new Date());
 
   const defaultState = () => ({
     date: todayStr(),
@@ -36,37 +50,14 @@
     customCategoryHistory: [], // { name, color }[] その他カテゴリの履歴（最近使った順）
   });
 
-  let currentUser = null;
-  let STORAGE_KEY = null;
+  let currentUser = null;   // Supabase の user オブジェクト
   let state = null;
 
-  // ---------- users (login) ----------
-  function getUsers() {
-    try { return JSON.parse(localStorage.getItem(USERS_KEY)) || {}; }
-    catch (e) { return {}; }
-  }
-  function saveUsers(users) {
-    localStorage.setItem(USERS_KEY, JSON.stringify(users));
-  }
-  function userExists(name) {
-    return Object.prototype.hasOwnProperty.call(getUsers(), name);
-  }
-  function createUser(name, pin) {
-    const users = getUsers();
-    users[name] = pin;
-    saveUsers(users);
-  }
-  function verifyUser(name, pin) {
-    const users = getUsers();
-    return users[name] === pin;
-  }
-
   // ---------- persistence ----------
-  function loadState() {
+  // 読み込んだ生データを「今日の状態」に整える（日付が変わっていればリセット）
+  function normalizeState(parsed) {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return defaultState();
-      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object" || !parsed.settings) return defaultState();
       if (parsed.date !== todayStr()) {
         // 日付が変わった → ストリーク更新して今日分をリセット
         const fresh = defaultState();
@@ -105,7 +96,7 @@
     if (!prev.lastSessionDate) return 0;
     const y = new Date();
     y.setDate(y.getDate() - 1);
-    const yesterday = y.toISOString().slice(0, 10);
+    const yesterday = localDateStr(y);
     if (prev.lastSessionDate === yesterday && prev.sessionsToday > 0) {
       return prev.streak; // 継続
     }
@@ -115,9 +106,84 @@
     return 0; // 途切れた
   }
 
-  function saveState() {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  // ---- cache (localStorage) ----
+  const cacheKey = () => currentUser ? CACHE_PREFIX + currentUser.id : null;
+  function readCache() {
+    try {
+      const raw = localStorage.getItem(cacheKey());
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) { return null; }
   }
+  function writeCache() {
+    try {
+      localStorage.setItem(cacheKey(), JSON.stringify({ state, dirty: hasUnsavedChanges }));
+    } catch (e) { /* storage full / private mode: ignore */ }
+  }
+
+  // ---- remote (Supabase) ----
+  async function fetchRemoteState() {
+    const { data, error } = await sb
+      .from("app_state")
+      .select("state")
+      .eq("user_id", currentUser.id)
+      .maybeSingle();
+    if (error) throw error;
+    return data ? data.state : null;
+  }
+
+  let saveTimer = null;
+  let saving = false;
+  let hasUnsavedChanges = false;
+
+  function setSyncStatus(kind) {
+    const el = $("syncStatus");
+    if (!el) return;
+    el.classList.remove("is-saving", "is-error");
+    if (kind === "saving") { el.textContent = "☁️ 保存中…"; el.classList.add("is-saving"); }
+    else if (kind === "error") { el.textContent = "⚠️ 未保存"; el.classList.add("is-error"); el.title = "通信できませんでした。次の変更時か再読み込みで再送します"; }
+    else { el.textContent = "☁️ 保存済み"; el.title = "クラウドへの保存状態"; }
+  }
+
+  async function flushSave() {
+    clearTimeout(saveTimer);
+    if (!currentUser || !state || !hasUnsavedChanges) return;
+    if (saving) { scheduleSave(); return; } // 送信中なら後でもう一度
+    saving = true;
+    hasUnsavedChanges = false;
+    setSyncStatus("saving");
+    const { error } = await sb
+      .from("app_state")
+      .upsert({ user_id: currentUser.id, state }, { onConflict: "user_id" });
+    saving = false;
+    if (error) {
+      console.warn("save failed", error);
+      hasUnsavedChanges = true;
+      setSyncStatus("error");
+    } else if (!hasUnsavedChanges) {
+      setSyncStatus("saved");
+    }
+    writeCache();
+  }
+
+  function scheduleSave() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(flushSave, SAVE_DELAY_MS);
+  }
+
+  // 既存コードはすべてこの saveState() を呼ぶので、中身だけ差し替え
+  function saveState() {
+    if (!currentUser || !state) return;
+    hasUnsavedChanges = true;
+    setSyncStatus("saving");
+    writeCache();
+    scheduleSave();
+  }
+
+  // タブを閉じる・裏に回すときは待たずに送る
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushSave();
+  });
+  window.addEventListener("pagehide", () => { flushSave(); });
 
   // ---------- DOM refs ----------
   const $ = (id) => document.getElementById(id);
@@ -126,8 +192,14 @@
   const appRoot = $("appRoot");
   const loginForm = $("loginForm");
   const loginNameInput = $("loginNameInput");
-  const loginPinInput = $("loginPinInput");
+  const loginEmailInput = $("loginEmailInput");
+  const loginPasswordInput = $("loginPasswordInput");
   const loginError = $("loginError");
+  const loginInfo = $("loginInfo");
+  const loginSubmitBtn = $("loginSubmitBtn");
+  const tabLogin = $("tabLogin");
+  const tabSignup = $("tabSignup");
+  const nameField = $("nameField");
   const activeUserName = $("activeUserName");
   const logoutBtn = $("logoutBtn");
 
@@ -1109,54 +1181,154 @@
     showToast("リセットしました");
   });
 
-  logoutBtn.addEventListener("click", () => {
+  logoutBtn.addEventListener("click", async () => {
     pauseTimer();
-    localStorage.removeItem(ACTIVE_USER_KEY);
-    currentUser = null;
-    state = null;
-    STORAGE_KEY = null;
-    appRoot.style.display = "none";
-    loginScreen.style.display = "flex";
-    loginNameInput.value = "";
-    loginPinInput.value = "";
-    loginError.textContent = "";
+    await flushSave();
+    // 共有端末を考えて、保存し終わったキャッシュは消しておく
+    if (!hasUnsavedChanges && cacheKey()) localStorage.removeItem(cacheKey());
+    await sb.auth.signOut(); // → onAuthStateChange の SIGNED_OUT で画面が戻る
   });
 
   // ---------- login flow ----------
-  loginForm.addEventListener("submit", (e) => {
-    e.preventDefault();
-    const name = loginNameInput.value.trim();
-    const pin = loginPinInput.value.trim();
+  let authMode = "login"; // "login" | "signup"
 
-    if (!name) { loginError.textContent = "名前を入力してね"; return; }
-    if (!/^\d{4}$/.test(pin)) { loginError.textContent = "合言葉は4桁の数字で入力してね"; return; }
-
-    if (userExists(name)) {
-      if (!verifyUser(name, pin)) {
-        loginError.textContent = "名前か合言葉が違うみたい";
-        return;
-      }
-    } else {
-      createUser(name, pin);
-    }
-
+  function setAuthMode(next) {
+    authMode = next;
+    const isSignup = next === "signup";
+    tabLogin.classList.toggle("is-active", !isSignup);
+    tabSignup.classList.toggle("is-active", isSignup);
+    tabLogin.setAttribute("aria-selected", String(!isSignup));
+    tabSignup.setAttribute("aria-selected", String(isSignup));
+    nameField.hidden = !isSignup;
+    loginPasswordInput.autocomplete = isSignup ? "new-password" : "current-password";
+    loginSubmitBtn.textContent = isSignup ? "登録してはじめる" : "ログイン";
     loginError.textContent = "";
-    localStorage.setItem(ACTIVE_USER_KEY, name);
-    loginAs(name);
+    loginInfo.textContent = "";
+  }
+  tabLogin.addEventListener("click", () => setAuthMode("login"));
+  tabSignup.addEventListener("click", () => setAuthMode("signup"));
+
+  function translateAuthError(err) {
+    const msg = (err && err.message) || "";
+    if (/Invalid login credentials/i.test(msg)) return "メールアドレスかパスワードが違うみたい";
+    if (/Email not confirmed/i.test(msg)) return "確認メールのリンクをまだ押していないみたい。メールを確認してね";
+    if (/already registered|already been registered/i.test(msg)) return "このメールアドレスはもう登録されているよ。「ログイン」から入ってね";
+    if (/Password should be at least/i.test(msg)) return "パスワードは6文字以上にしてね";
+    if (/rate limit/i.test(msg)) return "短時間に試しすぎたみたい。少し待ってからもう一度どうぞ";
+    if (/Failed to fetch|NetworkError/i.test(msg)) return "サーバーにつながらなかった。通信環境を確認してね";
+    return "うまくいかなかった：" + msg;
+  }
+
+  loginForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!sb) { loginError.textContent = "config.js に Supabase の URL とキーを設定してね"; return; }
+
+    const email = loginEmailInput.value.trim();
+    const password = loginPasswordInput.value;
+    const displayName = loginNameInput.value.trim();
+    loginError.textContent = "";
+    loginInfo.textContent = "";
+
+    loginSubmitBtn.disabled = true;
+    try {
+      if (authMode === "signup") {
+        const { data, error } = await sb.auth.signUp({
+          email,
+          password,
+          options: {
+            data: { display_name: displayName || email.split("@")[0] },
+            emailRedirectTo: location.origin + location.pathname,
+          },
+        });
+        if (error) throw error;
+        if (!data.session) {
+          // メール確認が有効なプロジェクトでは、ここでいったん止まる
+          loginInfo.textContent = "確認メールを送ったよ。メールのリンクを押してから「ログイン」してね。";
+          setTimeout(() => { setAuthMode("login"); loginInfo.textContent = "確認メールのリンクを押したら、ここからログインしてね。"; }, 0);
+        }
+        // session があれば onAuthStateChange が enterApp を呼ぶ
+      } else {
+        const { error } = await sb.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+      }
+    } catch (err) {
+      loginError.textContent = translateAuthError(err);
+    } finally {
+      loginSubmitBtn.disabled = false;
+    }
   });
 
-  function loginAs(name) {
-    currentUser = name;
-    STORAGE_KEY = `mebae-state-v1::${name}`;
-    state = loadState();
+  function displayNameOf(user) {
+    const meta = user.user_metadata || {};
+    return meta.display_name || (user.email ? user.email.split("@")[0] : "ゲスト");
+  }
 
-    activeUserName.textContent = name;
+  function showLogin() {
+    currentUser = null;
+    state = null;
+    hasUnsavedChanges = false;
+    clearTimeout(saveTimer);
+    appRoot.style.display = "none";
+    loginScreen.style.display = "flex";
+    loginPasswordInput.value = "";
+    loginError.textContent = "";
+  }
+
+  async function enterApp(user) {
+    currentUser = user;
+    const cached = readCache();
+    let raw = null;
+    let needsSave = false;
+
+    try {
+      const remote = await fetchRemoteState();
+      if (cached && cached.dirty && cached.state) {
+        // 前回送れなかった変更が残っている → そちらを優先して送り直す
+        raw = cached.state;
+        needsSave = true;
+      } else if (remote) {
+        raw = remote;
+      } else {
+        // クラウドにまだ何もない（初回）
+        raw = (cached && cached.state) || null;
+        needsSave = true;
+      }
+      setSyncStatus("saved");
+    } catch (err) {
+      console.warn("remote load failed, using cache", err);
+      raw = cached ? cached.state : null;
+      setSyncStatus("error");
+      showToast("クラウドに接続できなかったので、この端末の記録を表示しているよ");
+    }
+
+    if (!currentUser || currentUser.id !== user.id) return; // 読み込み中にログアウトされた
+    const before = raw && raw.date;
+    state = normalizeState(raw);
+    if (state.date !== before) needsSave = true; // 日付が変わってリセットした
+
+    activeUserName.textContent = displayNameOf(user);
     loginScreen.style.display = "none";
     appRoot.style.display = "block";
 
     renderAll();
-    saveState();
+    if (needsSave) saveState();
   }
+
+  // 別の端末で更新したぶんを、タブに戻ってきたときに取り込む
+  // （タイマー動作中や未保存の変更があるときは上書きしない）
+  document.addEventListener("visibilitychange", async () => {
+    if (document.visibilityState !== "visible") return;
+    if (!currentUser || !state || hasUnsavedChanges || saving) return;
+    if (running || secondsLeft !== secondsTotal || mode !== "focus") return;
+    try {
+      const remote = await fetchRemoteState();
+      if (!remote || hasUnsavedChanges || running) return;
+      if (JSON.stringify(remote) === JSON.stringify(state)) return;
+      state = normalizeState(remote);
+      renderAll();
+      writeCache();
+    } catch (e) { /* オフラインなら何もしない */ }
+  });
 
   // ---------- init ----------
   function renderAll() {
@@ -1185,11 +1357,23 @@
     renderSelectedDayEvents();
   }
 
-  const savedUser = localStorage.getItem(ACTIVE_USER_KEY);
-  if (savedUser && userExists(savedUser)) {
-    loginAs(savedUser);
+  // ---------- start ----------
+  if (!sb) {
+    showLogin();
+    loginError.textContent = configMissing
+      ? "config.js に Supabase の URL と anon キーを設定してね"
+      : "Supabase ライブラリを読み込めなかった。通信環境を確認してね";
   } else {
-    loginScreen.style.display = "flex";
-    appRoot.style.display = "none";
+    // ログイン状態の変化をここ1か所で受け取る
+    // （ページを開いた直後の INITIAL_SESSION で「前回のログインが残っているか」もわかる）
+    sb.auth.onAuthStateChange((event, session) => {
+      // コールバック内で直接 await すると supabase-js が詰まることがあるので、少し後ろにずらす
+      setTimeout(() => {
+        const user = session ? session.user : null;
+        if (!user) { if (currentUser || event === "INITIAL_SESSION") showLogin(); return; }
+        if (currentUser && currentUser.id === user.id) { currentUser = user; return; } // トークン更新など
+        enterApp(user);
+      }, 0);
+    });
   }
 })();

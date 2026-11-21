@@ -23,24 +23,34 @@
   <div class="login-card">
     <div class="login-mark">🌱</div>
     <h1>めばえ</h1>
-    <p class="login-sub">名前を入れて、あなた専用の記録を始めよう</p>
+    <p class="login-sub">ログインすると、どの端末からでも続きができるよ</p>
+
+    <div class="login-tabs" role="tablist">
+      <button type="button" class="login-tab is-active" id="tabLogin" role="tab" aria-selected="true">ログイン</button>
+      <button type="button" class="login-tab" id="tabSignup" role="tab" aria-selected="false">はじめて登録</button>
+    </div>
 
     <form id="loginForm">
-      <label class="login-field">
-        <span>名前</span>
-        <input type="text" id="loginNameInput" placeholder="例：たろう" autocomplete="off" maxlength="20" required>
+      <label class="login-field" id="nameField" hidden>
+        <span>ニックネーム</span>
+        <input type="text" id="loginNameInput" placeholder="例：たろう" autocomplete="nickname" maxlength="20">
       </label>
       <label class="login-field">
-        <span>合言葉（4桁の数字）</span>
-        <input type="password" id="loginPinInput" placeholder="例：1234" inputmode="numeric" maxlength="4" pattern="[0-9]{4}" required>
+        <span>メールアドレス</span>
+        <input type="email" id="loginEmailInput" placeholder="you@example.com" autocomplete="email" required>
+      </label>
+      <label class="login-field">
+        <span>パスワード（6文字以上）</span>
+        <input type="password" id="loginPasswordInput" placeholder="••••••" minlength="6" autocomplete="current-password" required>
       </label>
 
       <p class="login-error" id="loginError"></p>
+      <p class="login-info" id="loginInfo"></p>
 
       <div class="login-actions">
-        <button type="submit" class="btn btn-primary">ログイン / はじめる</button>
+        <button type="submit" class="btn btn-primary" id="loginSubmitBtn">ログイン</button>
       </div>
-      <p class="login-note">※この合言葉はこの端末だけで使う簡易的なものです。他のサービスと同じパスワードは入力しないでね。初めての名前なら自動で新規登録されます。</p>
+      <p class="login-note">データは Supabase に保存され、スマホとPCなど別の端末でも同じ記録が見られます。</p>
     </form>
   </div>
 </div>
@@ -68,6 +78,7 @@
       <span>👤</span>
       <span id="activeUserName">―</span>
     </div>
+    <div class="sync-pill" id="syncStatus" title="クラウドへの保存状態">☁️ 保存済み</div>
     <div class="streak-pill" title="連続で取り組んだ日数">
       <span class="streak-flame">🔥</span>
       <span id="streakCount">0</span>
@@ -370,6 +381,8 @@
 
 </div><!-- /appRoot -->
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="config.js"></script>
 <script src="script.js"></script>
 </body>
 </html>
